@@ -1,0 +1,72 @@
+import type { Integration, StackParser } from '@sentry/core';
+import { createStackParser, debug, getIntegrationsToSetup, stackParserFromStackParserOptions } from '@sentry/core';
+import { nodeStackLineParser } from '@sentry/core/server';
+import type { NodeOptions } from '@sentry/node';
+import {
+  consoleIntegration,
+  createGetModuleFromFilename,
+  eventFiltersIntegration,
+  functionToStringIntegration,
+  getCurrentScope,
+  initOpenTelemetry,
+  linkedErrorsIntegration,
+  nativeNodeFetchIntegration,
+  NodeClient,
+  onUncaughtExceptionIntegration,
+  onUnhandledRejectionIntegration,
+} from '@sentry/node';
+import { makeUtilityProcessTransport } from './transport.js';
+
+export const defaultStackParser: StackParser = createStackParser(nodeStackLineParser(createGetModuleFromFilename()));
+
+/** Get the default integrations for the main process SDK. */
+export function getDefaultIntegrations(): Integration[] {
+  const integrations = [
+    // Node integrations
+    eventFiltersIntegration(),
+    functionToStringIntegration(),
+    linkedErrorsIntegration(),
+    consoleIntegration(),
+    nativeNodeFetchIntegration(),
+    onUncaughtExceptionIntegration(),
+    onUnhandledRejectionIntegration(),
+  ];
+
+  return integrations;
+}
+
+/**
+ * Initialize Sentry in the Electron main process
+ */
+export function init(userOptions: NodeOptions = {}): void {
+  const optionsWithDefaults = {
+    defaultIntegrations: getDefaultIntegrations(),
+    transport: makeUtilityProcessTransport(),
+    sendClientReports: false,
+    ...userOptions,
+    stackParser: stackParserFromStackParserOptions(userOptions.stackParser || defaultStackParser),
+    // Events are sent via the main process but the Node SDK wont start without dsn
+    dsn: 'https://12345@dummy.dsn/12345',
+    includeServerName: false,
+  };
+
+  const options = {
+    ...optionsWithDefaults,
+    integrations: getIntegrationsToSetup(optionsWithDefaults),
+  };
+
+  if (options.debug) {
+    debug.enable();
+  }
+
+  const scope = getCurrentScope();
+  scope.update(options.initialScope);
+
+  const client = new NodeClient(options);
+  scope.setClient(client);
+  client.init();
+
+  if (options.enableOpenTelemetrySetup) {
+    initOpenTelemetry(client);
+  }
+}

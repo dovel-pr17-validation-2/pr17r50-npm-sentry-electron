@@ -1,0 +1,131 @@
+import type {
+  Attachment,
+  Client,
+  Envelope,
+  Event,
+  SerializedLog,
+  SerializedMetric,
+  SerializedStreamedSpanContainer,
+} from '@sentry/core';
+import { debug, forEachEnvelopeItem, parseEnvelope } from '@sentry/core';
+import { captureEvent, getClient } from '@sentry/node';
+import * as electron from 'electron';
+import { eventFromEnvelope } from '../common/envelope.js';
+import { getMagicMessage, isMagicMessage } from '../common/ipc.js';
+import { hideMatchingMessages } from './filter-listeners.js';
+import { applyProcessAttributes, normalizeDynamicSamplingContext } from './ipc.js';
+import { mergeEvents } from './merge.js';
+import { normalizeSpanStreamingEnvelope } from './normalize.js';
+import type { ElectronMainOptionsInternal } from './sdk.js';
+import { SDK_VERSION } from './version.js';
+
+function log(message: string): void {
+  debug.log(`[Utility Process] ${message}`);
+}
+
+/**
+ * We wrap `electron.utilityProcess.fork` so we can pass a messageport to any SDK running in the utility process
+ */
+export function configureUtilityProcessIPC(): void {
+  if (!electron.utilityProcess?.fork) {
+    return;
+  }
+
+  // eslint-disable-next-line typescript/unbound-method
+  electron.utilityProcess.fork = new Proxy(electron.utilityProcess.fork, {
+    apply: (target, thisArg, args: Parameters<typeof electron.utilityProcess.fork>) => {
+      // Call the underlying function to get the child process
+      const child: electron.UtilityProcess = target.apply(thisArg, args);
+
+      function getProcessName(): string {
+        const [, , options] = args;
+        return options?.serviceName || `pid:${child.pid}`;
+      }
+
+      // We don't send any messages unless we've heard from the child SDK. At that point we know it's ready to receive
+      // and will also filter out any messages we send so users don't see them
+      child.on('message', (msg: unknown) => {
+        if (isMagicMessage(msg)) {
+          log(`SDK started in utility process '${getProcessName()}'`);
+
+          const { port1, port2 } = new electron.MessageChannelMain();
+
+          port2.on('message', (msg) => {
+            if (msg.data instanceof Uint8Array || typeof msg.data === 'string') {
+              handleEnvelopeFromUtility(msg.data);
+            }
+          });
+          port2.start();
+
+          // Send one side of the message port to the child SDK
+          child.postMessage(getMagicMessage(), [port1]);
+        }
+      });
+
+      // Users must not see the messages the child SDK sends us
+      hideMatchingMessages(child, 'message', isMagicMessage);
+
+      return child;
+    },
+  });
+}
+
+function handleEnvelopeFromUtility(env: Uint8Array | string): void {
+  const envelope = parseEnvelope(env);
+
+  const eventAndAttachments = eventFromEnvelope(envelope);
+  if (eventAndAttachments) {
+    const [event, attachments] = eventAndAttachments;
+
+    captureEventFromUtility(event, attachments);
+  } else {
+    const client = getClient();
+
+    if (client) {
+      void client.sendEnvelope(prepareEnvelopeFromUtility(client, envelope));
+    }
+  }
+}
+
+/**
+ * Spans, logs and metrics from utility processes are forwarded without passing through the main
+ * process client, so we apply the main process release, environment, SDK and context attributes.
+ */
+function prepareEnvelopeFromUtility(client: Client, envelope: Envelope): Envelope {
+  const options = client.getOptions() as ElectronMainOptionsInternal;
+
+  normalizeDynamicSamplingContext(client, options, envelope);
+
+  if (envelope[0].sdk) {
+    envelope[0].sdk = { name: 'sentry.javascript.electron', version: SDK_VERSION };
+  }
+
+  forEachEnvelopeItem(envelope, (item, type) => {
+    if (type === 'span') {
+      for (const span of (item[1] as SerializedStreamedSpanContainer).items) {
+        // Like main process spans, only segment spans get the OS and device attributes
+        span.attributes = applyProcessAttributes(client, options, 'utility', span.attributes, !!span.is_segment) || {};
+      }
+    } else if (type === 'log' || type === 'trace_metric') {
+      for (const entry of (item[1] as { items: Array<SerializedLog | SerializedMetric> }).items) {
+        entry.attributes = applyProcessAttributes(client, options, 'utility', entry.attributes);
+      }
+    }
+  });
+
+  const [normalizedEnvelope] = normalizeSpanStreamingEnvelope(options, envelope, electron.app.getAppPath());
+  return normalizedEnvelope;
+}
+
+function captureEventFromUtility(event: Event, attachments: Attachment[]): void {
+  // Remove the environment as it defaults to 'production' and overwrites the main process environment
+  delete event.environment;
+  delete event.release;
+
+  // Remove the SDK info as we want the Electron SDK to be the one reporting the event
+  delete event.sdk?.name;
+  delete event.sdk?.version;
+  delete event.sdk?.packages;
+
+  captureEvent(mergeEvents(event, { tags: { 'event.process': 'utility' } }), { attachments });
+}

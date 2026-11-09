@@ -1,0 +1,69 @@
+import { expect } from 'vitest';
+import { electronTestRunner, getSpansFromEnvelope, SDK_VERSION } from '../../..';
+
+electronTestRunner(
+  __dirname,
+  {
+    // Browser Tracing fails on Electron v24
+    skip: (electronVersion) => electronVersion.major === 24,
+  },
+  async (ctx) => {
+    await ctx
+      .expect({
+        // The browser pageload transaction is streamed as a span envelope. The exact
+        // set of `browser.*` performance metric spans varies between Electron/Chromium
+        // versions, so we assert the pageload segment and the presence of the key
+        // metric spans rather than an exact list.
+        envelope: (envelope) => {
+          const [header] = envelope;
+          expect(header.sdk).toEqual({ name: 'sentry.javascript.electron', version: expect.any(String) });
+
+          const spans = getSpansFromEnvelope(envelope);
+          expect(spans).toBeDefined();
+
+          // The segment is the browser pageload span
+          const segment = spans?.find((s) => s.is_segment);
+          expect(segment).toMatchObject({
+            name: 'Pageload',
+            is_segment: true,
+            status: 'ok',
+            attributes: expect.objectContaining({
+              'sentry.op': { value: 'pageload', type: 'string' },
+              'sentry.origin': { value: 'auto.pageload.browser', type: 'string' },
+              'sentry.segment.name.source': { value: 'url', type: 'string' },
+              'sentry.sample_rate': { value: 1, type: 'integer' },
+              'os.name': { value: expect.any(String), type: 'string' },
+              // URLs are normalized relative to the app path
+              'url.full': { value: 'app:///src/index.html', type: 'string' },
+              'url.path': { value: '/src/index.html', type: 'string' },
+            }),
+          });
+
+          // All spans share the same trace and get the main process release, environment and SDK
+          for (const span of spans ?? []) {
+            expect(span.trace_id).toEqual(segment?.trace_id);
+            expect(span.attributes).toMatchObject({
+              'sentry.release': { value: 'some-release', type: 'string' },
+              'sentry.environment': { value: 'development', type: 'string' },
+              'sentry.sdk.name': { value: 'sentry.javascript.electron', type: 'string' },
+              'sentry.sdk.version': { value: SDK_VERSION, type: 'string' },
+              'electron.process': { value: 'renderer', type: 'string' },
+            });
+          }
+
+          // IP address inference is controlled by the main process
+          const container = envelope[1][0]?.[1] as { ingest_settings?: { infer_ip?: string } };
+          expect(container.ingest_settings?.infer_ip).toEqual('auto');
+
+          // The key browser performance metric spans are present as children
+          const ops = (spans ?? []).map(
+            (s) => (s.attributes as Record<string, { value?: unknown }> | undefined)?.['sentry.op']?.value,
+          );
+          for (const op of ['browser.connect', 'browser.cache', 'browser.dns', 'browser.request', 'browser.response']) {
+            expect(ops).toContain(op);
+          }
+        },
+      })
+      .run();
+  },
+);

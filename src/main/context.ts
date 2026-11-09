@@ -1,0 +1,56 @@
+/* eslint-disable max-lines */
+import type { Event, EventHint, SdkInfo } from '@sentry/core';
+import type { NodeClient } from '@sentry/node';
+import { app } from 'electron';
+import { SDK_VERSION } from './version.js';
+
+export const SDK_NAME = 'sentry.javascript.electron';
+
+/** Gets SDK info */
+export function getSdkInfo(inferIp: boolean): SdkInfo {
+  return {
+    name: SDK_NAME,
+    packages: [
+      {
+        name: 'npm:@sentry/electron',
+        version: SDK_VERSION,
+      },
+    ],
+    version: SDK_VERSION,
+    settings: { infer_ip: inferIp ? 'auto' : 'never' },
+  };
+}
+
+/** Gets the default release name */
+export function getDefaultReleaseName(): string {
+  const app_name = app.name || app.getName();
+  return `${app_name.replace(/\W/g, '-')}@${app.getVersion()}`;
+}
+
+/** Gets the default environment */
+export function getDefaultEnvironment(): string {
+  return app.isPackaged ? 'production' : 'development';
+}
+
+/**
+ * How long scope saves may reuse the event defaults. Building them runs
+ * every event processor and some are slow, such as `app.getAppMetrics()`.
+ */
+export const EVENT_DEFAULTS_TTL_MS = 5_000;
+
+/**
+ * Gets the default event data by calling all event processors.
+ */
+export async function getEventDefaults(client: NodeClient): Promise<Event> {
+  let event: Event | null = { message: 'test' };
+  const eventHint: EventHint = {};
+
+  for (const processor of client.getEventProcessors()) {
+    if (event === null) break;
+    event = await processor(event, eventHint);
+  }
+
+  delete event?.message;
+
+  return event || {};
+}

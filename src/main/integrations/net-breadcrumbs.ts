@@ -1,0 +1,347 @@
+import type { Client, SpanAttributes } from '@sentry/core';
+import {
+  addBreadcrumb,
+  debug,
+  defineIntegration,
+  fill,
+  filterCollectedUrl,
+  filterCollectedUrlQuery,
+  getBreadcrumbLogLevelFromHttpStatusCode,
+  getSanitizedUrlStringFromUrlObject,
+  getTraceData,
+  getUrlQuery,
+  hasSpanStreamingEnabled,
+  isURLObjectRelative,
+  LRUMap,
+  parseStringToURLObject,
+  SEMANTIC_ATTRIBUTE_SENTRY_ORIGIN,
+  SentryNonRecordingSpan,
+  setHttpStatus,
+  startInactiveSpan,
+  stringMatchesSomePattern,
+  withActiveSpan,
+} from '@sentry/core';
+import {
+  HTTP_REQUEST_METHOD,
+  SERVER_ADDRESS,
+  SERVER_PORT,
+  URL_FULL,
+  URL_PATH,
+  URL_QUERY,
+  URL_SCHEME,
+} from '@sentry/conventions/attributes';
+import { logger } from '@sentry/node';
+import type { ClientRequest, ClientRequestConstructorOptions, IncomingMessage } from 'electron';
+import { net as electronNet } from 'electron';
+import type { UrlObject } from 'url';
+import { format as urlFormat } from 'url';
+
+type ShouldTraceFn = (method: string, url: string) => boolean;
+
+export interface NetOptions {
+  /**
+   * Whether breadcrumbs should be captured for net requests
+   *
+   * Defaults to: true
+   */
+  breadcrumbs?: boolean;
+  /**
+   * Whether to capture transaction spans for net requests
+   *
+   * true | false | (method: string, url: string) => boolean
+   * Defaults to: true
+   */
+  tracing?: ShouldTraceFn | boolean;
+  /**
+   * Whether to also capture Sentry logs for net requests
+   *
+   * Defaults to: false
+   */
+  logs?: boolean;
+}
+
+/**
+ * Trimmed down version of the code from Electron here:
+ * https://github.com/electron/electron/blob/f3df76dbdc58cb704637b89357e1400791c92cfe/lib/browser/api/net.ts#L209-L269
+ *
+ * We want to match the final URL that Electron uses
+ */
+function parseOptions(optionsIn: ClientRequestConstructorOptions | string): { method: string; url: string } {
+  if (typeof optionsIn === 'string') {
+    // For full URL strings, use the WHATWG URL API directly
+    try {
+      return { method: 'GET', url: new URL(optionsIn).href };
+    } catch {
+      // If URL parsing fails, return the original string
+      return { method: 'GET', url: optionsIn };
+    }
+  }
+
+  const method = (optionsIn.method || 'GET').toUpperCase();
+  const options = optionsIn;
+
+  let url = 'url' in options ? options.url : undefined;
+
+  if (!url) {
+    const urlObj: UrlObject = {};
+    urlObj.protocol = options.protocol || 'http:';
+
+    if (options.host) {
+      urlObj.host = options.host;
+    } else {
+      if (options.hostname) {
+        urlObj.hostname = options.hostname;
+      } else {
+        urlObj.hostname = 'localhost';
+      }
+
+      if (options.port) {
+        urlObj.port = options.port;
+      }
+    }
+
+    // Use parseStringToURLObject for path parsing (handles relative URLs)
+    const pathObj = parseStringToURLObject(options.path || '/');
+    urlObj.pathname = pathObj?.pathname;
+    urlObj.search = pathObj?.search;
+    urlObj.hash = pathObj?.hash;
+    url = urlFormat(urlObj);
+  }
+
+  return {
+    method,
+    url,
+  };
+}
+
+type RequestOptions = string | ClientRequestConstructorOptions;
+type RequestMethod = (opt: RequestOptions, ...args: unknown[]) => ClientRequest;
+type WrappedRequestMethodFactory = (original: RequestMethod) => RequestMethod;
+
+/**
+ * Builds the span name and OpenTelemetry-aligned attributes for an outgoing `net` request, mirroring
+ * the `http.client` spans emitted by `@sentry/node`'s fetch instrumentation. Under span streaming the
+ * name is the low-cardinality `${method} ${server.address}` and Relay infers the high-cardinality
+ * description from `url.full`. Without streaming the name is the full sanitized URL.
+ */
+function getSpanDetails(method: string, url: string, client: Client): { name: string; attributes: SpanAttributes } {
+  const parsed = parseStringToURLObject(url);
+  const sanitizedUrl = parsed ? getSanitizedUrlStringFromUrlObject(parsed) : url;
+
+  const attributes: SpanAttributes = {
+    [SEMANTIC_ATTRIBUTE_SENTRY_ORIGIN]: 'auto.http.electron.net',
+    [HTTP_REQUEST_METHOD]: method,
+    [URL_FULL]: filterCollectedUrl(url, client),
+  };
+
+  let serverAddress: string | undefined;
+
+  if (parsed) {
+    attributes[URL_PATH] = parsed.pathname;
+
+    const query = filterCollectedUrlQuery(getUrlQuery(parsed.search), client);
+    if (query) {
+      attributes[URL_QUERY] = query;
+    }
+
+    if (!isURLObjectRelative(parsed)) {
+      serverAddress = parsed.hostname;
+      attributes[SERVER_ADDRESS] = serverAddress;
+      attributes[URL_SCHEME] = parsed.protocol.replace(/:$/, '');
+
+      if (parsed.port) {
+        attributes[SERVER_PORT] = Number(parsed.port);
+      }
+    }
+  }
+
+  // Under span streaming the name must be low-cardinality (method + domain); Relay derives the
+  // detailed description from `url.full`. https://conventions.sentry.dev/names/#http-client
+  let name: string;
+  if (hasSpanStreamingEnabled(client)) {
+    name = serverAddress ? `${method} ${serverAddress}` : method;
+  } else {
+    name = `${method} ${sanitizedUrl}`;
+  }
+
+  return { name, attributes };
+}
+
+function createWrappedRequestFactory(
+  { tracing, breadcrumbs, logs }: NetOptions,
+  client: Client,
+): WrappedRequestMethodFactory {
+  const { tracePropagationTargets, propagateTraceparent } = client.getOptions();
+  const streamingEnabled = hasSpanStreamingEnabled(client);
+  // We're caching results so we don't have to recompute regexp every time we create a request.
+  const createSpanUrlMap = new LRUMap<string, boolean>(100);
+  const headersUrlMap = new LRUMap<string, boolean>(100);
+
+  const shouldCreateSpan = (method: string, url: string): boolean => {
+    if (tracing === undefined) {
+      return true;
+    }
+
+    if (tracing === false) {
+      return false;
+    }
+
+    const key = `${method}:${url}`;
+
+    const cachedDecision = createSpanUrlMap.get(key);
+    if (cachedDecision !== undefined) {
+      return cachedDecision;
+    }
+
+    const decision = tracing === true || tracing(method, url);
+    createSpanUrlMap.set(key, decision);
+    return decision;
+  };
+
+  // This will be considerably simpler once `tracingOrigins` is removed in the next major release
+  const shouldAttachTraceData = (method: string, url: string): boolean => {
+    const key = `${method}:${url}`;
+
+    const cachedDecision = headersUrlMap.get(key);
+    if (cachedDecision !== undefined) {
+      return cachedDecision;
+    }
+
+    if (tracePropagationTargets) {
+      const decision = stringMatchesSomePattern(url, tracePropagationTargets);
+      headersUrlMap.set(key, decision);
+      return decision;
+    }
+
+    // We cannot reach here since either `tracePropagationTargets` or `tracingOrigins` will be defined but TypeScript
+    // cannot infer that
+    return true;
+  };
+
+  /**
+   * Captures Breadcrumb based on provided request/response pair
+   */
+  const addRequestBreadcrumb = (
+    event: string,
+    method: string,
+    url: string,
+    req: ClientRequest,
+    res?: IncomingMessage,
+  ): void => {
+    const level = getBreadcrumbLogLevelFromHttpStatusCode(res?.statusCode);
+
+    addBreadcrumb(
+      {
+        type: 'http',
+        category: 'electron.net',
+        data: {
+          url,
+          method: method,
+          status_code: res?.statusCode,
+        },
+        level,
+      },
+      {
+        event,
+        request: req,
+        response: res,
+      },
+    );
+
+    if (!logs) {
+      return;
+    }
+
+    const attributes = {
+      'sentry.origin': 'auto.electron.net',
+      statusCode: res?.statusCode,
+    };
+
+    switch (level) {
+      case 'error':
+        logger.error(logger.fmt`Electron.net request failed: ${method} ${url}`, attributes);
+        break;
+      case 'warning':
+        logger.warn(logger.fmt`Electron.net request warning: ${method} ${url}`, attributes);
+        break;
+      default:
+        logger.info(logger.fmt`Electron.net request succeeded: ${method} ${url}`, attributes);
+    }
+  };
+
+  return function wrappedRequestMethodFactory(originalRequestMethod: RequestMethod): RequestMethod {
+    return function requestMethod(
+      this: typeof electronNet,
+      reqOptions: RequestOptions,
+      ...args: unknown[]
+    ): ClientRequest {
+      const { url, method } = parseOptions(reqOptions);
+      const request = originalRequestMethod.apply(this, [reqOptions, ...args]);
+
+      if (url.match(/sentry_key/) || request.getHeader('x-sentry-auth')) {
+        return request;
+      }
+
+      const span = shouldCreateSpan(method, url)
+        ? startInactiveSpan({
+            ...getSpanDetails(method, url, client),
+            onlyIfParent: !streamingEnabled,
+            op: 'http.client',
+          })
+        : new SentryNonRecordingSpan();
+
+      if (shouldAttachTraceData(method, url)) {
+        const inject = (): void => {
+          for (const [key, value] of Object.entries(getTraceData({ propagateTraceparent }))) {
+            debug.log(`[Tracing] Adding ${key} header ${value} to outgoing request to "${url}": `);
+            request.setHeader(key, value);
+          }
+        };
+
+        if (span.isRecording()) {
+          withActiveSpan(span, inject);
+        } else {
+          inject();
+        }
+      }
+
+      return request
+        .once('response', function (this: ClientRequest, res: IncomingMessage): void {
+          if (breadcrumbs !== false) {
+            addRequestBreadcrumb('response', method, url, this, res);
+          }
+
+          if (res.statusCode) {
+            setHttpStatus(span, res.statusCode);
+          }
+
+          span.end();
+        })
+        .once('error', function (this: ClientRequest, _error: Error): void {
+          if (breadcrumbs !== false) {
+            addRequestBreadcrumb('error', method, url, this, undefined);
+          }
+
+          setHttpStatus(span, 500);
+          span.end();
+        });
+    };
+  };
+}
+
+/**
+ * Electron 'net' module integration
+ */
+export const electronNetIntegration = defineIntegration((options: NetOptions = {}) => {
+  return {
+    name: 'ElectronNet',
+    setup(client) {
+      // No need to instrument if we don't want to track anything
+      if (options.breadcrumbs === false && options.tracing === false) {
+        return;
+      }
+
+      fill(electronNet, 'request', createWrappedRequestFactory(options, client));
+    },
+  };
+});

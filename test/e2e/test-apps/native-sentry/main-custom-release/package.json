@@ -1,0 +1,9 @@
+{
+  "name": "native-sentry-main-custom-release",
+  "description": "Native Main Crash (Custom Release Name)",
+  "version": "1.0.0",
+  "main": "src/main.js",
+  "dependencies": {
+    "@sentry/electron": "5.6.0"
+  }
+}

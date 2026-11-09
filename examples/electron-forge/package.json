@@ -1,0 +1,17 @@
+{
+  "name": "electron-forge",
+  "description": "Electron Forge example",
+  "version": "1.0.0",
+  "main": "src/index.js",
+  "config": {
+    "forge": {}
+  },
+  "dependencies": {
+    "electron-squirrel-startup": "^1.0.1",
+    "@sentry/electron": "^8.3.0"
+  },
+  "devDependencies": {
+    "@electron-forge/cli": "^8.0.1",
+    "electron": "^44.7.0"
+  }
+}

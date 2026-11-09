@@ -1,0 +1,668 @@
+// oxlint-disable max-lines
+import { EventEmitter } from 'node:events';
+import type {
+  Attachment,
+  Client,
+  DynamicSamplingContext,
+  Envelope,
+  Event,
+  EventHint,
+  ScopeData,
+  SerializedStreamedSpan,
+  SerializedStreamedSpanContainer,
+  TransportMakeRequestResponse,
+} from '@sentry/core';
+import {
+  _INTERNAL_captureSerializedLog,
+  _INTERNAL_captureSerializedMetric,
+  addItemToEnvelope,
+  createAttachmentEnvelopeItem,
+  createEventEnvelope,
+  debug,
+  forEachEnvelopeItem,
+  parseEnvelope,
+  prepareEvent,
+  type SerializedLog,
+  type SerializedMetric,
+} from '@sentry/core';
+import { captureEvent, getClient, getCurrentScope, getIsolationScope } from '@sentry/node';
+import type { WebContents } from 'electron';
+import { app, ipcMain, protocol, webContents } from 'electron';
+import { eventFromEnvelope, profileChunkFromEnvelope, spanContainerFromEnvelope } from '../common/envelope.js';
+import type { IpcUtils, RendererStatus } from '../common/ipc.js';
+import { ipcChannelUtils, IPCMode } from '../common/ipc.js';
+import { registerProtocol } from './electron-normalize.js';
+import { createRendererEventLoopBlockStatusHandler } from './integrations/renderer-anr.js';
+import { rendererProfileFromIpc } from './integrations/renderer-profiling.js';
+import { getOsDeviceLogAttributes } from './log.js';
+import { mergeEvents } from './merge.js';
+import { normalizeProfileChunkEnvelope, normalizeReplayEnvelope, normalizeSpanStreamingEnvelope } from './normalize.js';
+import { markRendererEvent } from './renderer-event.js';
+import type { ElectronMainOptionsInternal } from './sdk.js';
+import { SDK_VERSION } from './version.js';
+
+interface IpcMainEvents {
+  'pageload-transaction': [event: Event, contents: WebContents | undefined];
+  'pageload-spans': [spans: SerializedStreamedSpan[], contents: WebContents | undefined];
+}
+
+export const ipcMainHooks = new EventEmitter<IpcMainEvents>();
+
+let KNOWN_RENDERERS: Set<number> | undefined;
+let WINDOW_ID_TO_WEB_CONTENTS: Map<string, number> | undefined;
+
+/**
+ * Finds the webContents that sent a protocol `start` request and maps its
+ * window id to it.
+ *
+ * Every page load creates a new window id in the renderer, so a reload
+ * reaches here with an id that no webContents maps to yet. The lookup
+ * probes every webContents, including ones already mapped, so the stale
+ * mapping of a reloaded renderer is replaced.
+ */
+function newProtocolRenderer(startWindowId: string | undefined): void {
+  KNOWN_RENDERERS = KNOWN_RENDERERS || new Set();
+  WINDOW_ID_TO_WEB_CONTENTS = WINDOW_ID_TO_WEB_CONTENTS || new Map();
+
+  if (startWindowId && WINDOW_ID_TO_WEB_CONTENTS.has(startWindowId)) {
+    return;
+  }
+
+  for (const wc of webContents.getAllWebContents()) {
+    const wcId = wc.id;
+
+    if (wc.isDestroyed()) {
+      continue;
+    }
+
+    wc.executeJavaScript('window.__SENTRY_RENDERER_ID__').then((windowId: string | undefined) => {
+      if (!windowId || !KNOWN_RENDERERS || !WINDOW_ID_TO_WEB_CONTENTS) {
+        return;
+      }
+
+      for (const [previousWindowId, previousWcId] of WINDOW_ID_TO_WEB_CONTENTS) {
+        if (previousWcId === wcId && previousWindowId !== windowId) {
+          WINDOW_ID_TO_WEB_CONTENTS.delete(previousWindowId);
+        }
+      }
+
+      WINDOW_ID_TO_WEB_CONTENTS.set(windowId, wcId);
+
+      if (!KNOWN_RENDERERS.has(wcId)) {
+        KNOWN_RENDERERS.add(wcId);
+
+        wc.once('destroyed', () => {
+          KNOWN_RENDERERS?.delete(wcId);
+
+          for (const [mappedWindowId, mappedWcId] of WINDOW_ID_TO_WEB_CONTENTS || []) {
+            if (mappedWcId === wcId) {
+              WINDOW_ID_TO_WEB_CONTENTS?.delete(mappedWindowId);
+            }
+          }
+        });
+      }
+    }, debug.error);
+  }
+}
+
+/** Gets the process name used to tag data from a renderer */
+export function getRendererProcessName(
+  options: ElectronMainOptionsInternal | undefined,
+  contents: WebContents | undefined,
+): string {
+  return contents ? options?.getRendererName?.(contents) || 'renderer' : 'renderer';
+}
+
+function prepareRendererEvent(
+  options: ElectronMainOptionsInternal,
+  event: Event,
+  dynamicSamplingContext: Partial<DynamicSamplingContext> | undefined,
+  contents: WebContents | undefined,
+): Event {
+  const process = getRendererProcessName(options, contents);
+
+  // Ensure breadcrumbs are empty as they sent via scope updates
+  event.breadcrumbs = event.breadcrumbs || [];
+
+  // Remove the environment as it defaults to 'production' and overwrites the main process environment
+  delete event.environment;
+
+  // Remove the SDK info as we want the Electron SDK to be the one reporting the event
+  delete event.sdk?.name;
+  delete event.sdk?.version;
+  delete event.sdk?.packages;
+
+  if (dynamicSamplingContext) {
+    event.sdkProcessingMetadata = { ...event.sdkProcessingMetadata, dynamicSamplingContext };
+  }
+
+  markRendererEvent(event);
+
+  return mergeEvents(event, { tags: { 'event.process': process } });
+}
+
+function captureEventFromRenderer(
+  options: ElectronMainOptionsInternal,
+  event: Event,
+  dynamicSamplingContext: Partial<DynamicSamplingContext> | undefined,
+  attachments: Attachment[],
+  contents: WebContents | undefined,
+): void {
+  captureEvent(prepareRendererEvent(options, event, dynamicSamplingContext, contents), { attachments });
+}
+
+/**
+ * Sends a feedback event from a renderer and returns the transport result.
+ *
+ * `captureEvent` does not expose the send result, so the event is prepared
+ * and sent directly. `beforeSend` and `sampleRate` only apply to error
+ * events, so nothing that `captureEvent` would do is skipped for feedback.
+ */
+async function sendFeedbackFromRenderer(
+  client: Client,
+  options: ElectronMainOptionsInternal,
+  event: Event,
+  dynamicSamplingContext: Partial<DynamicSamplingContext> | undefined,
+  attachments: Attachment[],
+  contents: WebContents | undefined,
+): Promise<TransportMakeRequestResponse> {
+  const hint: EventHint = { attachments, event_id: event.event_id };
+  const clientOptions = client.getOptions();
+
+  const prepared = await prepareEvent(
+    clientOptions,
+    prepareRendererEvent(options, event, dynamicSamplingContext, contents),
+    hint,
+    getCurrentScope(),
+    client,
+    getIsolationScope(),
+  );
+
+  if (!prepared) {
+    return {};
+  }
+
+  let envelope = createEventEnvelope(prepared, client.getDsn(), clientOptions._metadata, clientOptions.tunnel);
+  for (const attachment of hint.attachments || []) {
+    envelope = addItemToEnvelope(envelope, createAttachmentEnvelopeItem(attachment));
+  }
+
+  return client.sendEnvelope(envelope);
+}
+
+let cached_public_key: string | undefined;
+
+export function normalizeDynamicSamplingContext(
+  client: Client,
+  options: ElectronMainOptionsInternal,
+  envelope: Envelope,
+): DynamicSamplingContext | undefined {
+  const dynamicSamplingContext = envelope[0].trace as DynamicSamplingContext | undefined;
+
+  if (dynamicSamplingContext) {
+    if (!cached_public_key) {
+      cached_public_key = client.getDsn()?.publicKey;
+    }
+
+    dynamicSamplingContext.release = options.release;
+    dynamicSamplingContext.environment = options.environment;
+    dynamicSamplingContext.public_key = cached_public_key;
+  }
+
+  return dynamicSamplingContext;
+}
+
+/**
+ * Handles a feedback envelope from a renderer and returns the send result.
+ *
+ * Only feedback events are sent from here. Other event types must go via
+ * `captureEvent` so that `beforeSend` and `sampleRate` apply to them.
+ *
+ * Never throws so the renderer always gets a valid response.
+ */
+async function handleFeedback(
+  client: Client,
+  options: ElectronMainOptionsInternal,
+  env: Uint8Array | string,
+  contents?: WebContents,
+): Promise<TransportMakeRequestResponse> {
+  try {
+    const envelope = parseEnvelope(env);
+    const dynamicSamplingContext = normalizeDynamicSamplingContext(client, options, envelope);
+    const eventAndAttachments = eventFromEnvelope(envelope);
+
+    if (eventAndAttachments?.[0].type !== 'feedback') {
+      debug.warn('sentry-electron received a non-feedback envelope on the feedback channel');
+      return {};
+    }
+
+    const [event, attachments] = eventAndAttachments;
+    return await sendFeedbackFromRenderer(client, options, event, dynamicSamplingContext, attachments, contents);
+  } catch (error) {
+    debug.warn('sentry-electron failed to send feedback from renderer', error);
+    return {};
+  }
+}
+
+// While buffering is active, streamed span envelopes from renderers are held here so the startup
+// tracing integration can merge pageload spans that arrive over multiple envelopes. See
+// handleEnvelope for details.
+let bufferedSpanEnvelopes: Envelope[] | undefined;
+
+/**
+ * Starts buffering streamed span envelopes from renderers
+ */
+export function startSpanEnvelopeBuffering(): void {
+  bufferedSpanEnvelopes = bufferedSpanEnvelopes || [];
+}
+
+/**
+ * Stops buffering and empties the streamed span envelope buffer.
+ *
+ * Spans matching `extractTraceId` are removed from their envelopes and returned so they can be
+ * merged into the startup trace. Envelopes that still contain spans after extraction are forwarded
+ * to the transport.
+ */
+export function flushSpanEnvelopeBuffer(extractTraceId?: string): SerializedStreamedSpan[] {
+  const extracted: SerializedStreamedSpan[] = [];
+  const buffered = bufferedSpanEnvelopes || [];
+  bufferedSpanEnvelopes = undefined;
+
+  for (const envelope of buffered) {
+    const container = spanContainerFromEnvelope(envelope);
+
+    if (!container) {
+      continue;
+    }
+
+    if (extractTraceId) {
+      extracted.push(...container.items.filter((span) => span.trace_id === extractTraceId));
+      container.items = container.items.filter((span) => span.trace_id !== extractTraceId);
+    }
+
+    if (container.items.length > 0) {
+      // Keep the envelope item header in sync with the number of remaining spans
+      forEachEnvelopeItem(envelope, (item, type) => {
+        if (type === 'span') {
+          (item[0] as { item_count?: number }).item_count = container.items.length;
+        }
+      });
+
+      void getClient()?.sendEnvelope(envelope);
+    }
+  }
+
+  return extracted;
+}
+
+function handleEnvelope(
+  client: Client,
+  options: ElectronMainOptionsInternal,
+  env: Uint8Array | string,
+  contents?: WebContents,
+): void {
+  const envelope = parseEnvelope(env);
+  const dynamicSamplingContext = normalizeDynamicSamplingContext(client, options, envelope);
+
+  const eventAndAttachments = eventFromEnvelope(envelope);
+  if (eventAndAttachments) {
+    const [event, attachments, profile] = eventAndAttachments;
+
+    if (profile) {
+      // We have a 'profile' item and there is no way for us to pass this through event capture
+      // so store them in a cache and reattach them via the `beforeEnvelope` hook before sending
+      rendererProfileFromIpc(event, profile);
+    }
+
+    if (
+      ipcMainHooks.listenerCount('pageload-transaction') > 0 &&
+      event.type === 'transaction' &&
+      event.contexts?.trace?.origin === 'auto.pageload.browser'
+    ) {
+      ipcMainHooks.emit('pageload-transaction', event, contents);
+      return;
+    }
+
+    captureEventFromRenderer(options, event, dynamicSamplingContext, attachments, contents);
+  } else {
+    // Check if this is a profile_chunk envelope (from UI profiling)
+    const profileChunk = profileChunkFromEnvelope(envelope);
+    if (profileChunk) {
+      const normalizedEnvelope = normalizeProfileChunkEnvelope(options, envelope, app.getAppPath());
+      void client.sendEnvelope(normalizedEnvelope);
+      return;
+    }
+
+    const spans = spanContainerFromEnvelope(envelope);
+    if (spans) {
+      // A v1 standalone span has the same item type but no `items`
+      const isContainer = Array.isArray(spans.items);
+
+      if (isContainer) {
+        handleSpansFromRenderer(client, options, spans, contents);
+      }
+
+      const [normalizedSpanEnvelope, segmentOrigin] = normalizeSpanStreamingEnvelope(
+        options,
+        envelope,
+        app.getAppPath(),
+      );
+
+      // While the startup tracing integration is waiting for a renderer pageload, the pageload
+      // span tree can arrive over multiple envelopes because the renderer SDK flushes on an
+      // interval. The pageload segment span gets re-created in the startup trace, so pageload
+      // spans sent directly from earlier envelopes would reference a segment that is never sent.
+      // We buffer streamed span envelopes until the pageload segment arrives and then hand all
+      // spans from its trace to the integration so they can be merged into the startup span.
+      // Buffered spans from other traces are forwarded unmodified once the wait ends.
+      if (bufferedSpanEnvelopes && isContainer) {
+        bufferedSpanEnvelopes.push(normalizedSpanEnvelope);
+
+        if (segmentOrigin === 'auto.pageload.browser' && ipcMainHooks.listenerCount('pageload-spans') > 0) {
+          const pageloadTraceId = spanContainerFromEnvelope(normalizedSpanEnvelope)?.items.find(
+            (span) => span.is_segment,
+          )?.trace_id;
+
+          ipcMainHooks.emit('pageload-spans', flushSpanEnvelopeBuffer(pageloadTraceId), contents);
+        }
+
+        return;
+      }
+
+      void client.sendEnvelope(normalizedSpanEnvelope);
+      return;
+    }
+
+    const normalizedEnvelope = normalizeReplayEnvelope(options, envelope, app.getAppPath());
+    // Pass other types of envelope straight to the client
+    void client.sendEnvelope(normalizedEnvelope);
+  }
+}
+
+/** Is object defined and has keys */
+function hasKeys(obj: unknown): boolean {
+  return obj != undefined && Object.keys(obj).length > 0;
+}
+
+/**
+ * Handle scope updates from renderer processes
+ */
+function handleScope(options: ElectronMainOptionsInternal, jsonScope: string): void {
+  let sentScope: ScopeData;
+  try {
+    sentScope = JSON.parse(jsonScope) as ScopeData;
+  } catch {
+    debug.warn('sentry-electron received an invalid scope message');
+    return;
+  }
+
+  const scope = getCurrentScope();
+
+  if (hasKeys(sentScope.user)) {
+    scope.setUser(sentScope.user);
+  }
+
+  if (hasKeys(sentScope.tags)) {
+    scope.setTags(sentScope.tags);
+  }
+
+  if (hasKeys(sentScope.extra)) {
+    scope.setExtras(sentScope.extra);
+  }
+
+  for (const attachment of sentScope.attachments || []) {
+    scope.addAttachment(attachment);
+  }
+
+  const breadcrumb = (sentScope.breadcrumbs || []).pop();
+  if (breadcrumb) {
+    scope.addBreadcrumb(breadcrumb, options?.maxBreadcrumbs || 100);
+  }
+}
+
+function handleAttributes(
+  client: Client,
+  options: ElectronMainOptionsInternal,
+  contents: WebContents | undefined,
+  maybeAttributes?: SerializedLog['attributes'],
+  includeOsDevice: boolean = true,
+): SerializedLog['attributes'] {
+  const process = getRendererProcessName(options, contents);
+
+  return applyProcessAttributes(client, options, process, maybeAttributes, includeOsDevice);
+}
+
+/**
+ * Applies the main process release, environment, SDK and context attributes to a span, log or
+ * metric from another process
+ */
+export function applyProcessAttributes(
+  client: Client,
+  options: ElectronMainOptionsInternal,
+  process: string,
+  maybeAttributes?: SerializedLog['attributes'],
+  includeOsDevice: boolean = true,
+): SerializedLog['attributes'] {
+  const attributes: SerializedLog['attributes'] = maybeAttributes || {};
+
+  if (options.release) {
+    attributes['sentry.release'] = { value: options.release, type: 'string' };
+  }
+
+  if (options.environment) {
+    attributes['sentry.environment'] = { value: options.environment, type: 'string' };
+  }
+
+  attributes['sentry.sdk.name'] = { value: 'sentry.javascript.electron', type: 'string' };
+  attributes['sentry.sdk.version'] = { value: SDK_VERSION, type: 'string' };
+
+  attributes['electron.process'] = { value: process, type: 'string' };
+
+  if (!includeOsDevice) {
+    return attributes;
+  }
+
+  const osDeviceAttributes = getOsDeviceLogAttributes(client);
+
+  if (osDeviceAttributes['os.name']) {
+    attributes['os.name'] = { value: osDeviceAttributes['os.name'], type: 'string' };
+  }
+  if (osDeviceAttributes['os.version']) {
+    attributes['os.version'] = { value: osDeviceAttributes['os.version'], type: 'string' };
+  }
+  if (osDeviceAttributes['device.brand']) {
+    attributes['device.brand'] = { value: osDeviceAttributes['device.brand'], type: 'string' };
+  }
+  if (osDeviceAttributes['device.model']) {
+    attributes['device.model'] = { value: osDeviceAttributes['device.model'], type: 'string' };
+  }
+  if (osDeviceAttributes['device.family']) {
+    attributes['device.family'] = { value: osDeviceAttributes['device.family'], type: 'string' };
+  }
+
+  return attributes;
+}
+
+/**
+ * Streamed spans from renderers are forwarded without passing through the main process client, so
+ * we apply the main process release, environment, SDK and context attributes here.
+ */
+function handleSpansFromRenderer(
+  client: Client,
+  options: ElectronMainOptionsInternal,
+  container: SerializedStreamedSpanContainer,
+  contents: WebContents | undefined,
+): void {
+  // IP address inference is controlled from the main process, as it is for events
+  container.ingest_settings = {
+    ...container.ingest_settings,
+    infer_ip: client.getDataCollectionOptions().userInfo ? 'auto' : 'never',
+  };
+
+  for (const span of container.items) {
+    // Like main process spans, only segment spans get the OS and device attributes
+    span.attributes = handleAttributes(client, options, contents, span.attributes, !!span.is_segment) || {};
+  }
+}
+
+function handleLogFromRenderer(
+  client: Client,
+  options: ElectronMainOptionsInternal,
+  log: SerializedLog,
+  contents: WebContents | undefined,
+): void {
+  log.attributes = handleAttributes(client, options, contents, log.attributes);
+  _INTERNAL_captureSerializedLog(client, log);
+}
+
+function handleMetricFromRenderer(
+  client: Client,
+  options: ElectronMainOptionsInternal,
+  metric: SerializedMetric,
+  contents: WebContents | undefined,
+): void {
+  metric.attributes = handleAttributes(client, options, contents, metric.attributes);
+  _INTERNAL_captureSerializedMetric(client, metric);
+}
+
+/** Enables Electron protocol handling */
+function configureProtocol(client: Client, ipcUtil: IpcUtils, options: ElectronMainOptionsInternal): void {
+  if (app.isReady()) {
+    throw new Error("Sentry SDK should be initialized before the Electron app 'ready' event is fired");
+  }
+
+  const scheme = {
+    scheme: ipcUtil.namespace,
+    privileges: { bypassCSP: true, corsEnabled: true, supportFetchAPI: true, secure: true },
+  };
+
+  protocol.registerSchemesAsPrivileged([scheme]);
+
+  // We Proxy this function so that later user calls to registerSchemesAsPrivileged don't overwrite our custom scheme
+  // eslint-disable-next-line typescript/unbound-method
+  protocol.registerSchemesAsPrivileged = new Proxy(protocol.registerSchemesAsPrivileged, {
+    apply: (target, __, args: Parameters<typeof protocol.registerSchemesAsPrivileged>) => {
+      target([...args[0], scheme]);
+    },
+  });
+
+  const rendererStatusChanged = createRendererEventLoopBlockStatusHandler(client);
+
+  app
+    .whenReady()
+    .then(() => {
+      for (const sesh of options.getSessions()) {
+        registerProtocol(sesh.protocol, ipcUtil.namespace, async (request) => {
+          const getWebContents = (): WebContents | undefined => {
+            const webContentsId = request.windowId ? WINDOW_ID_TO_WEB_CONTENTS?.get(request.windowId) : undefined;
+            return webContentsId ? webContents.fromId(webContentsId) : undefined;
+          };
+
+          const data = request.body;
+          if (ipcUtil.urlMatches(request.url, 'start')) {
+            newProtocolRenderer(request.windowId);
+          } else if (ipcUtil.urlMatches(request.url, 'scope') && data) {
+            handleScope(options, data.toString());
+          } else if (ipcUtil.urlMatches(request.url, 'envelope') && data) {
+            handleEnvelope(client, options, data, getWebContents());
+          } else if (ipcUtil.urlMatches(request.url, 'feedback') && data) {
+            return JSON.stringify(await handleFeedback(client, options, data, getWebContents()));
+          } else if (ipcUtil.urlMatches(request.url, 'structured-log') && data) {
+            let log: SerializedLog;
+            try {
+              log = JSON.parse(data.toString());
+            } catch {
+              debug.warn('sentry-electron received an invalid structured-log message');
+              return;
+            }
+            handleLogFromRenderer(client, options, log, getWebContents());
+          } else if (ipcUtil.urlMatches(request.url, 'metric') && data) {
+            let metric: SerializedMetric;
+            try {
+              metric = JSON.parse(data.toString());
+            } catch {
+              debug.warn('sentry-electron received an invalid metric message');
+              return;
+            }
+            handleMetricFromRenderer(client, options, metric, getWebContents());
+          } else if (rendererStatusChanged && ipcUtil.urlMatches(request.url, 'status') && data) {
+            const contents = getWebContents();
+            if (contents) {
+              let status: RendererStatus;
+              try {
+                status = (JSON.parse(data.toString()) as { status: RendererStatus }).status;
+              } catch {
+                debug.warn('sentry-electron received an invalid status message');
+                return;
+              }
+              rendererStatusChanged(status, contents);
+            }
+          }
+        });
+      }
+    })
+    .catch((error) => debug.error(error));
+}
+
+/**
+ * Hooks IPC for communication with the renderer processes
+ */
+function configureClassic(client: Client, ipcUtil: IpcUtils, options: ElectronMainOptionsInternal): void {
+  ipcMain.on(ipcUtil.createKey('start'), ({ sender }) => {
+    const id = sender.id;
+    // Keep track of renderers that are using IPC
+    KNOWN_RENDERERS = KNOWN_RENDERERS || new Set();
+
+    if (KNOWN_RENDERERS.has(id)) {
+      return;
+    }
+
+    // In older Electron, sender can be destroyed before this callback is called
+    if (!sender.isDestroyed()) {
+      KNOWN_RENDERERS.add(id);
+
+      sender.once('destroyed', () => {
+        KNOWN_RENDERERS?.delete(id);
+      });
+    }
+  });
+  ipcMain.on(ipcUtil.createKey('scope'), (_, jsonScope: string) => handleScope(options, jsonScope));
+  ipcMain.on(ipcUtil.createKey('envelope'), ({ sender }, env: Uint8Array | string) =>
+    handleEnvelope(client, options, env, sender),
+  );
+  ipcMain.handle(ipcUtil.createKey('feedback'), ({ sender }, env: Uint8Array | string) =>
+    handleFeedback(client, options, env, sender),
+  );
+  ipcMain.on(ipcUtil.createKey('structured-log'), ({ sender }, log: SerializedLog) =>
+    handleLogFromRenderer(client, options, log, sender),
+  );
+  ipcMain.on(ipcUtil.createKey('metric'), ({ sender }, metric: SerializedMetric) =>
+    handleMetricFromRenderer(client, options, metric, sender),
+  );
+
+  const rendererStatusChanged = createRendererEventLoopBlockStatusHandler(client);
+  if (rendererStatusChanged) {
+    ipcMain.on(ipcUtil.createKey('status'), ({ sender }, status: RendererStatus) =>
+      rendererStatusChanged(status, sender),
+    );
+  }
+}
+
+/** Sets up communication channels with the renderer */
+export function configureIPC(client: Client, options: ElectronMainOptionsInternal): void {
+  const ipcUtil = ipcChannelUtils(options.ipcNamespace);
+
+  // eslint-disable-next-line no-bitwise
+  if ((options.ipcMode & IPCMode.Protocol) > 0) {
+    configureProtocol(client, ipcUtil, options);
+  }
+
+  // eslint-disable-next-line no-bitwise
+  if ((options.ipcMode & IPCMode.Classic) > 0) {
+    configureClassic(client, ipcUtil, options);
+  }
+
+  // The OS and device attributes resolve asynchronously so we fetch them before the first renderer
+  // spans arrive
+  void app.whenReady().then(() => getOsDeviceLogAttributes(client));
+}

@@ -1,0 +1,28 @@
+{
+  "name": "electron-forge-vite",
+  "productName": "electron-forge-vite",
+  "version": "1.0.0",
+  "description": "Electron Forge Vite example",
+  "main": ".vite/build/main.cjs",
+  "scripts": {
+    "build": "yarn package",
+    "start": "electron-forge start",
+    "package": "electron-forge package",
+    "make": "electron-forge make",
+    "publish": "electron-forge publish",
+    "lint": "echo \"No linting configured\""
+  },
+  "devDependencies": {
+    "@electron-forge/cli": "^8.0.1",
+    "@electron-forge/plugin-auto-unpack-natives": "^8.0.1",
+    "@electron-forge/plugin-vite": "^8.0.1",
+    "@sentry/bundler-plugins": "^11.8.0",
+    "electron": "^44.7.0",
+    "vite": "^8.3.4"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@sentry/electron": "^8.3.0",
+    "electron-squirrel-startup": "^1.0.1"
+  }
+}

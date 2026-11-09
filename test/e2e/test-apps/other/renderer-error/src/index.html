@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+  </head>
+  <body>
+    <script>
+      const { init, logger } = require('@sentry/electron/renderer');
+
+      init({
+        debug: true,
+        enableLogs: true,
+      });
+
+      setTimeout(() => {
+        logger.trace('User clicked submit button', {
+          buttonId: 'submit-form',
+          formId: 'user-profile',
+          timestamp: Date.now()
+        });
+      }, 1000);
+    </script>
+  </body>
+</html>

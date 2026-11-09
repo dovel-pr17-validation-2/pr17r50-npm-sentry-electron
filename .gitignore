@@ -1,0 +1,25 @@
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+stats.json
+dist/
+esm/
+coverage
+node_modules/
+stats.json
+
+# Eslint
+.eslintcache
+.vagrant
+
+/preload
+/renderer
+/main
+/common
+/utility
+/native
+/index.*
+/integrations.*
+/ipc.*
+*.tgz
+/src/main/version.ts

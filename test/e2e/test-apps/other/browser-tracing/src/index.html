@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+  </head>
+  <body>
+    <script>
+      const { init, browserTracingIntegration } = require('@sentry/electron/renderer');
+
+      init({
+        debug: true,
+        integrations: [browserTracingIntegration()],
+        tracesSampleRate: 1,
+      });
+    </script>
+  </body>
+</html>

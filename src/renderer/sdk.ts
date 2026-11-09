@@ -1,0 +1,111 @@
+/* eslint-disable deprecation/deprecation */
+/* eslint-disable no-restricted-globals */
+import type { BrowserOptions } from '@sentry/browser';
+import { getDefaultIntegrations as getDefaultBrowserIntegrations, init as browserInit } from '@sentry/browser';
+import type { Integration } from '@sentry/core';
+import { debug } from '@sentry/core';
+import { scopeToMainIntegration } from './integrations/scope-to-main.js';
+import { electronRendererStackParser } from './stack-parse.js';
+import { makeRendererTransport } from './transport.js';
+
+/** Get the default integrations for the renderer SDK. */
+export function getDefaultIntegrations(options: ElectronRendererOptions): Integration[] {
+  return [...removeUnsupported(getDefaultBrowserIntegrations(options)), scopeToMainIntegration()];
+}
+
+function removeUnsupported(integrations: Integration[]): Integration[] {
+  return integrations.filter((i) => i.name !== 'BrowserSession' && i.name !== 'CultureContext');
+}
+
+function wrapIntegrations(options: ElectronRendererOptions): BrowserOptions['integrations'] {
+  const userIntegrations = options.integrations;
+  const addScopeToMain = options.defaultIntegrations !== false;
+
+  return (defaults) => {
+    const integrations = removeUnsupported(defaults);
+    if (addScopeToMain) {
+      integrations.push(scopeToMainIntegration());
+    }
+
+    return typeof userIntegrations === 'function'
+      ? userIntegrations(integrations)
+      : [...integrations, ...(userIntegrations || [])];
+  };
+}
+
+export interface ElectronRendererOptionsInternal extends Omit<BrowserOptions, 'dsn' | 'environment' | 'release'> {
+  /** @deprecated `dsn` should only be passed to the main process `Sentry.init` call */
+  dsn?: string;
+  /** @deprecated `release` should only be passed to the main process `Sentry.init` call */
+  release?: string;
+  /** @deprecated `environment` should only be passed to the main process `Sentry.init` call */
+  environment?: string;
+
+  /**
+   * Custom namespace for IPC channels and protocol routes.
+   *
+   * Valid characters are a-z, 0-9, hyphen (-).
+   * Should match `ipcNamespace` passed in the main process.
+   *
+   * @default "sentry-ipc"
+   */
+  ipcNamespace: string;
+}
+
+// eslint-disable-next-line typescript/no-empty-interface
+interface ElectronRendererOptions extends Partial<ElectronRendererOptionsInternal> {
+  //
+}
+
+/**
+ * Initialize Sentry in the Electron renderer process
+ * @param options SDK options
+ * @param originalInit Optional init function for a specific framework SDK
+ * @returns
+ */
+export function init<O extends ElectronRendererOptions>(
+  options: ElectronRendererOptions & O = {} as ElectronRendererOptions & O,
+  // This parameter name ensures that TypeScript error messages contain a hint for fixing SDK version mismatches
+  originalInit: (if_you_get_a_typescript_error_ensure_sdks_use_version_v11_11_0: O) => void = browserInit,
+): void {
+  // Ensure the browser SDK is only init'ed once.
+  if (window?.__SENTRY__RENDERER_INIT__) {
+    debug.warn(`The browser SDK has already been initialized.
+If init has been called in the preload and contextIsolation is disabled, is not required to call init in the renderer`);
+    return;
+  }
+
+  window.__SENTRY__RENDERER_INIT__ = true;
+
+  // Disable client reports for renderer as the sdk should only send
+  // events using the main process.
+  options.sendClientReports = false;
+
+  // Framework SDKs only set `defaultIntegrations` when it is undefined, so
+  // we adapt their defaults through `integrations` instead.
+  options.integrations = wrapIntegrations(options);
+
+  if (options.stackParser === undefined) {
+    options.stackParser = electronRendererStackParser;
+  }
+
+  if (options.ipcNamespace === undefined) {
+    options.ipcNamespace = 'sentry-ipc';
+  }
+
+  // eslint-disable-next-line deprecation/deprecation
+  if (options.dsn === undefined) {
+    // Events are sent via the main process but browser SDK wont start without dsn
+    // eslint-disable-next-line deprecation/deprecation
+    options.dsn = 'https://12345@dummy.dsn/12345';
+  }
+
+  if (options.transport === undefined) {
+    options.transport = makeRendererTransport;
+  }
+
+  // We only handle initialScope in the main process otherwise it can cause race conditions over IPC
+  delete options.initialScope;
+
+  originalInit(options);
+}

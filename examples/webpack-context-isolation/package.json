@@ -1,0 +1,21 @@
+{
+  "name": "webpack-context-isolation",
+  "description": "Webpack 5 app with contextIsolation and sandbox",
+  "version": "1.0.0",
+  "scripts": {
+    "start": "electron .",
+    "build": "webpack"
+  },
+  "main": "dist/main.js",
+  "devDependencies": {
+    "@sentry/bundler-plugins": "^11.8.0",
+    "csp-html-webpack-plugin": "^5.1.0",
+    "html-webpack-plugin": "^5.6.8",
+    "warnings-to-errors-webpack-plugin": "^2.3.0",
+    "webpack": "^5.111.1",
+    "webpack-cli": "^7.2.3"
+  },
+  "dependencies": {
+    "@sentry/electron": "^8.3.0"
+  }
+}

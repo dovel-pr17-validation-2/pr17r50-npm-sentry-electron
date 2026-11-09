@@ -1,0 +1,150 @@
+import type { Log, ParameterizedString, SeverityLevel } from '@sentry/core';
+import { addBreadcrumb, captureMessage, defineIntegration } from '@sentry/core';
+import type { NodeClient } from '@sentry/node';
+import { childProcessIntegration as nodeChildProcessIntegration, logger } from '@sentry/node';
+import { app } from 'electron';
+import type { ExitReason } from '../electron-normalize.js';
+import { EXIT_REASONS } from '../electron-normalize.js';
+import type { ElectronMainOptions } from '../sdk.js';
+
+type NodeChildProcessOptions = NonNullable<Parameters<typeof nodeChildProcessIntegration>[0]>;
+
+type OrBool<T> = {
+  [P in keyof T]: T[P] | boolean;
+};
+
+export interface ChildProcessOptions extends NodeChildProcessOptions {
+  /** Child process events that generate breadcrumbs */
+  breadcrumbs: Readonly<ExitReason[]>;
+  /** Child process events that generate Sentry events */
+  events: Readonly<ExitReason[]>;
+  /**
+   * Whether to also capture Sentry logs for child process events
+   *
+   * default: false
+   */
+  logs: boolean;
+}
+
+const DEFAULT_OPTIONS: ChildProcessOptions = {
+  breadcrumbs: EXIT_REASONS,
+  events: ['abnormal-exit', 'launch-failed', 'integrity-failure'],
+  logs: false,
+};
+
+type LogFn = (msg: ParameterizedString, attributes: Log['attributes']) => void;
+
+/** Gets message and severity */
+function getMessageAndSeverity(
+  reason: ExitReason,
+  process: string,
+): { message: string; messageFmt: ParameterizedString; level: SeverityLevel; log: LogFn } {
+  const message = `'${process}' process exited with '${reason}'`;
+  const messageFmt = logger.fmt`'${process}' process exited with '${reason}'`;
+
+  switch (reason) {
+    case 'abnormal-exit':
+    case 'killed':
+      return { message, level: 'warning', log: logger.warn, messageFmt };
+    case 'crashed':
+    case 'oom':
+    case 'launch-failed':
+    case 'integrity-failure':
+      return { message, level: 'fatal', log: logger.error, messageFmt };
+    default:
+      return { message, level: 'debug', log: logger.info, messageFmt };
+  }
+}
+
+/**
+ * Adds breadcrumbs for:
+ * - Electron child process events
+ * - Node `child_process` events
+ * - Node `worker_threads` events
+ */
+export const childProcessIntegration = defineIntegration((userOptions: Partial<OrBool<ChildProcessOptions>> = {}) => {
+  const { breadcrumbs, events } = userOptions;
+
+  const nodeIntegration = nodeChildProcessIntegration(userOptions);
+
+  const options: ChildProcessOptions = {
+    breadcrumbs: Array.isArray(breadcrumbs) ? breadcrumbs : breadcrumbs === false ? [] : DEFAULT_OPTIONS.breadcrumbs,
+    events: Array.isArray(events) ? events : events === false ? [] : DEFAULT_OPTIONS.events,
+    logs: !!userOptions.logs,
+  };
+
+  return {
+    name: 'ChildProcess',
+    setup(client: NodeClient) {
+      nodeIntegration.setup?.(client);
+
+      const { breadcrumbs, events } = options;
+      const allReasons = Array.from(new Set([...breadcrumbs, ...events]));
+
+      // only hook these events if we're after more than just the unresponsive event
+      if (allReasons.length > 0) {
+        const clientOptions = client.getOptions() as ElectronMainOptions;
+        const logs = options.logs;
+
+        app.on('child-process-gone', (_, details) => {
+          const { reason } = details;
+          const { message, level, log, messageFmt } = getMessageAndSeverity(details.reason, details.type);
+
+          // Capture message first
+          if (events.includes(reason)) {
+            captureMessage(message, { level, tags: { 'event.process': details.type } });
+          }
+
+          // And then add breadcrumbs for subsequent events
+          if (breadcrumbs.includes(reason)) {
+            addBreadcrumb({
+              type: 'process',
+              category: 'child-process',
+              message,
+              level,
+              data: details,
+            });
+
+            if (logs) {
+              log(messageFmt, {
+                'sentry.origin': 'auto.electron.child-process',
+                exitCode: details.exitCode,
+                name: details.name,
+                serviceName: details.serviceName,
+              });
+            }
+          }
+        });
+
+        app.on('render-process-gone', (_, contents, details) => {
+          const { reason } = details;
+          const name = clientOptions?.getRendererName?.(contents) || 'renderer';
+          const { message, level, log, messageFmt } = getMessageAndSeverity(details.reason, name);
+
+          // Capture message first
+          if (events.includes(reason)) {
+            captureMessage(message, level);
+          }
+
+          // And then add breadcrumbs for subsequent events
+          if (breadcrumbs.includes(reason)) {
+            addBreadcrumb({
+              type: 'process',
+              category: 'child-process',
+              message,
+              level,
+              data: details,
+            });
+
+            if (logs) {
+              log(messageFmt, {
+                'sentry.origin': 'auto.electron.child-process',
+                exitCode: details.exitCode,
+              });
+            }
+          }
+        });
+      }
+    },
+  };
+});

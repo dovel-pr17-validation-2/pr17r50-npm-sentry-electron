@@ -1,0 +1,10 @@
+{
+  "name": "native-sentry-child-exec",
+  "description": "Native Child Exec Crash",
+  "version": "1.0.0",
+  "main": "src/main.js",
+  "dependencies": {
+    "@sentry/electron": "5.6.0",
+    "crashy-cli": "1.0.1"
+  }
+}
